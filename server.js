@@ -1,6 +1,6 @@
-// Signaling server: serves the web page and relays WebRTC handshake messages
-// between the two peers of a password-protected room. Files never pass
-// through here — they travel directly between browsers.
+// Signaling server: serves the web page, tracks who is in each
+// password-protected room, and relays WebRTC handshake messages between
+// peers. Files never pass through here — they travel directly between browsers.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -8,9 +8,10 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
+const MAX_PEERS = 10;
 const INDEX = fs.readFileSync(path.join(__dirname, 'public', 'index.html'));
 
-// room name -> { salt, hash, peers: Set<ws> }
+// room name -> { salt, hash, peers: Map<id, ws> }
 const rooms = new Map();
 
 function hashPassword(password, salt) {
@@ -39,13 +40,14 @@ function send(ws, msg) {
 function leave(ws) {
   const room = rooms.get(ws.room);
   if (!room) return;
-  room.peers.delete(ws);
-  for (const peer of room.peers) send(peer, { type: 'peer-left' });
+  room.peers.delete(ws.id);
+  for (const peer of room.peers.values()) send(peer, { type: 'peer-left', id: ws.id });
   if (room.peers.size === 0) rooms.delete(ws.room);
   ws.room = null;
 }
 
 wss.on('connection', (ws) => {
+  ws.id = crypto.randomUUID();
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
@@ -54,35 +56,36 @@ wss.on('connection', (ws) => {
     try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === 'join') {
-      const name = String(msg.room || '').trim().slice(0, 64);
+      const roomName = String(msg.room || '').trim().slice(0, 64);
+      const name = String(msg.name || '').trim().slice(0, 32);
       const password = String(msg.password || '');
-      if (!name || !password) return send(ws, { type: 'error', message: 'Room and password are required.' });
+      if (!roomName || !password || !name) return send(ws, { type: 'error', message: 'Name, room and password are required.' });
       if (ws.room) leave(ws);
 
-      let room = rooms.get(name);
+      let room = rooms.get(roomName);
       if (!room) {
         // First peer creates the room and sets its password.
         const salt = crypto.randomBytes(16);
-        room = { salt, hash: hashPassword(password, salt), peers: new Set() };
-        rooms.set(name, room);
+        room = { salt, hash: hashPassword(password, salt), peers: new Map() };
+        rooms.set(roomName, room);
       } else if (!crypto.timingSafeEqual(room.hash, hashPassword(password, room.salt))) {
         return send(ws, { type: 'error', message: 'Wrong password.' });
-      } else if (room.peers.size >= 2) {
+      } else if (room.peers.size >= MAX_PEERS) {
         return send(ws, { type: 'error', message: 'Room is full.' });
       }
 
-      room.peers.add(ws);
-      ws.room = name;
-      send(ws, { type: 'joined', peers: room.peers.size });
-      // The peer already waiting starts the WebRTC handshake.
-      for (const peer of room.peers) if (peer !== ws) send(peer, { type: 'peer-joined' });
+      const others = [...room.peers.values()].map((p) => ({ id: p.id, name: p.name }));
+      room.peers.set(ws.id, ws);
+      ws.room = roomName;
+      ws.name = name;
+      send(ws, { type: 'joined', id: ws.id, peers: others });
+      for (const peer of room.peers.values()) if (peer !== ws) send(peer, { type: 'peer-joined', id: ws.id, name });
       return;
     }
 
     if (msg.type === 'signal' && ws.room) {
-      const room = rooms.get(ws.room);
-      if (!room) return;
-      for (const peer of room.peers) if (peer !== ws) send(peer, { type: 'signal', data: msg.data });
+      const target = rooms.get(ws.room)?.peers.get(msg.to);
+      if (target) send(target, { type: 'signal', from: ws.id, data: msg.data });
     }
   });
 

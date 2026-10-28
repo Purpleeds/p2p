@@ -5,178 +5,368 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>P2P Share</title>
 <style>
-  :root { --bg: #f5f5f4; --card: #fff; --text: #1c1917; --muted: #78716c; --accent: #2563eb; --border: #e7e5e4; }
+  :root { --bg: #f5f5f4; --card: #fff; --text: #1c1917; --muted: #78716c; --accent: #2563eb; --border: #e7e5e4; --bad: #dc2626; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #1c1917; --card: #292524; --text: #f5f5f4; --muted: #a8a29e; --accent: #60a5fa; --border: #44403c; }
+    :root { --bg: #1c1917; --card: #292524; --text: #f5f5f4; --muted: #a8a29e; --accent: #60a5fa; --border: #44403c; --bad: #f87171; }
   }
   * { box-sizing: border-box; }
   body { margin: 0; font: 16px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
-  main { max-width: 520px; margin: 40px auto; padding: 0 16px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
+  main { max-width: 560px; margin: 40px auto; padding: 0 16px; }
+  #app { display: grid; gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
   h1 { margin: 0 0 4px; font-size: 1.5rem; }
+  h2 { margin: 0 0 8px; font-size: 1rem; }
+  .muted { color: var(--muted); font-size: .9rem; }
   p.sub { margin: 0 0 20px; color: var(--muted); font-size: .9rem; }
   label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 4px; }
   input[type=text], input[type=password] { width: 100%; padding: 10px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
-  button { padding: 10px 16px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  button { padding: 8px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; font-size: .9rem; cursor: pointer; white-space: nowrap; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--border); }
   button:disabled { opacity: .5; cursor: not-allowed; }
-  #status { margin: 16px 0; font-size: .9rem; color: var(--muted); }
-  .hidden { display: none; }
-  ul { list-style: none; padding: 0; margin: 16px 0 0; }
-  li { padding: 10px 0; border-top: 1px solid var(--border); font-size: .9rem; word-break: break-all; }
+  .hidden { display: none !important; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top: 1px solid var(--border); font-size: .9rem; }
+  li:first-child { border-top: 0; }
+  li .grow { flex: 1; min-width: 0; word-break: break-all; }
+  li.transfer { display: block; word-break: break-all; }
   progress { width: 100%; height: 8px; }
   a { color: var(--accent); }
+  .bad { color: var(--bad); }
 </style>
 </head>
 <body>
 <main>
-  <div class="card">
+  <div class="card" id="joinCard">
     <h1>P2P Share</h1>
     <p class="sub">Files go straight from browser to browser. The first person into a room sets its password.</p>
-
     <form id="joinForm">
+      <label for="name">Your name</label>
+      <input id="name" type="text" required maxlength="32" autocomplete="nickname">
       <label for="room">Room name</label>
       <input id="room" type="text" required maxlength="64" autocomplete="off">
       <label for="password">Password</label>
       <input id="password" type="password" required>
       <button type="submit">Join room</button>
+      <p id="joinError" class="bad"></p>
     </form>
+  </div>
 
-    <div id="share" class="hidden">
-      <input id="fileInput" type="file" multiple>
-      <button id="sendBtn" disabled>Send</button>
+  <div id="app" class="hidden">
+    <div class="card">
+      <h1 id="roomTitle"></h1>
+      <div id="status" class="muted"></div>
     </div>
 
-    <div id="status"></div>
-    <ul id="files"></ul>
+    <div class="card hidden" id="requestsCard">
+      <h2>Incoming files</h2>
+      <ul id="requests"></ul>
+    </div>
+
+    <div class="card">
+      <h2>People</h2>
+      <ul id="people"></ul>
+    </div>
+
+    <div class="card">
+      <h2>Shared in this room</h2>
+      <p class="muted">Anyone in the room can download files you share while this tab stays open.</p>
+      <button id="shareBtn">Share files…</button>
+      <ul id="sharedFiles" style="margin-top:12px"></ul>
+    </div>
+
+    <div class="card">
+      <h2>Transfers</h2>
+      <ul id="transfers"></ul>
+    </div>
   </div>
 </main>
+
+<input id="shareInput" type="file" multiple class="hidden">
+<input id="sendInput" type="file" class="hidden">
 
 <script>
 const CHUNK = 16 * 1024;
 const $ = (id) => document.getElementById(id);
-let ws, pc, channel, incoming, joined = false;
+const uid = () => crypto.randomUUID();
 
-function setStatus(text) { $('status').textContent = text; }
+let ws, myId, myName;
+const peers = new Map();        // peerId -> { name, pc, control, catalog, failed }
+const myShared = new Map();     // fileId -> File
+const pendingSends = new Map(); // transferId -> { peerId, file, row } (waiting for accept)
+const expected = new Map();     // transferId -> peerId (files we asked for or accepted)
+const requests = new Map();     // transferId -> { peerId, name, size } (offers waiting on us)
 
-function addRow(label) {
-  const li = document.createElement('li');
-  li.innerHTML = '<div></div><progress max="1" value="0"></progress>';
-  li.firstChild.textContent = label;
-  $('files').prepend(li);
-  return li;
+// Small DOM helper. Text always goes through textContent so names can't inject HTML.
+function el(tag, props = {}, ...children) {
+  const node = Object.assign(document.createElement(tag), props);
+  node.append(...children.filter((c) => c != null));
+  return node;
 }
+
+function fmtSize(n) {
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
+function nameOf(peerId) { return peers.get(peerId)?.name ?? 'someone'; }
+
+// ---------- Rendering ----------
+
+function render() {
+  const others = [...peers.entries()];
+  $('status').textContent = others.length ? `${others.length + 1} people here` : 'Waiting for others to join…';
+
+  $('people').replaceChildren(
+    el('li', {}, el('span', { className: 'grow', textContent: `${myName} (you)` })),
+    ...others.map(([id, p]) => {
+      const ready = p.control?.readyState === 'open';
+      const btn = el('button', { className: 'ghost', textContent: 'Send file…', disabled: !ready });
+      btn.onclick = () => pickFileFor(id);
+      return el('li', {},
+        el('span', { className: 'grow', textContent: p.name }),
+        ready ? null : el('span', { className: 'muted', textContent: p.failed ? "couldn't connect" : 'connecting…' }),
+        btn);
+    }),
+  );
+
+  const rows = [];
+  for (const [fileId, file] of myShared) {
+    const btn = el('button', { className: 'ghost', textContent: 'Stop sharing' });
+    btn.onclick = () => { myShared.delete(fileId); broadcastCatalog(); render(); };
+    rows.push(el('li', {}, el('span', { className: 'grow', textContent: `${file.name} · ${fmtSize(file.size)} · you` }), btn));
+  }
+  for (const [peerId, p] of others) {
+    for (const f of p.catalog) {
+      const btn = el('button', { textContent: 'Download' });
+      btn.onclick = () => requestDownload(peerId, f);
+      rows.push(el('li', {}, el('span', { className: 'grow', textContent: `${f.name} · ${fmtSize(f.size)} · ${p.name}` }), btn));
+    }
+  }
+  $('sharedFiles').replaceChildren(...(rows.length ? rows : [el('li', { className: 'muted', textContent: 'Nothing shared yet.' })]));
+
+  $('requestsCard').classList.toggle('hidden', requests.size === 0);
+  $('requests').replaceChildren(...[...requests.entries()].map(([tid, r]) => {
+    const yes = el('button', { textContent: 'Accept' });
+    const no = el('button', { className: 'ghost', textContent: 'Decline' });
+    yes.onclick = () => answerOffer(tid, true);
+    no.onclick = () => answerOffer(tid, false);
+    return el('li', {},
+      el('span', { className: 'grow', textContent: `${nameOf(r.peerId)} wants to send you ${r.name} (${fmtSize(r.size)})` }),
+      yes, no);
+  }));
+}
+
+function addTransferRow(label) {
+  const text = el('div', { textContent: label });
+  const bar = el('progress', { max: 1, value: 0 });
+  const li = el('li', { className: 'transfer' }, text, bar);
+  $('transfers').prepend(li);
+  return { li, text, bar };
+}
+
+// ---------- Signaling ----------
 
 $('joinForm').onsubmit = (e) => {
   e.preventDefault();
+  $('joinError').textContent = '';
+  myName = $('name').value.trim();
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}`);
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room: $('room').value, password: $('password').value }));
-  ws.onclose = () => joined && setStatus('Disconnected from server.');
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'join', name: myName, room: $('room').value, password: $('password').value }));
+  ws.onclose = () => { if (myId) $('status').textContent = 'Disconnected from server. Reload to rejoin.'; };
   // Handle messages one at a time so ICE candidates never race the SDP.
   let queue = Promise.resolve();
   ws.onmessage = ({ data }) => { queue = queue.then(() => handle(JSON.parse(data))).catch(console.error); };
 };
 
+function signal(to, data) { ws.send(JSON.stringify({ type: 'signal', to, data })); }
+
 async function handle(msg) {
-  if (msg.type === 'error') { setStatus(msg.message); ws.close(); return; }
+  if (msg.type === 'error') { $('joinError').textContent = msg.message; ws.close(); return; }
   if (msg.type === 'joined') {
-    joined = true;
-    $('joinForm').classList.add('hidden');
-    $('share').classList.remove('hidden');
-    setStatus(msg.peers === 1 ? 'Waiting for the other person to join…' : 'Connecting…');
-    createPeer();
+    myId = msg.id;
+    $('joinCard').classList.add('hidden');
+    $('app').classList.remove('hidden');
+    $('roomTitle').textContent = `Room: ${$('room').value.trim()}`;
+    // The newcomer opens a connection to everyone already in the room.
+    for (const p of msg.peers) {
+      const peer = createPeer(p.id, p.name);
+      setupControl(p.id, peer.pc.createDataChannel('control'));
+      await peer.pc.setLocalDescription(await peer.pc.createOffer());
+      signal(p.id, { sdp: peer.pc.localDescription });
+    }
+    render();
   }
-  if (msg.type === 'peer-joined') {
-    setStatus('Connecting…');
-    createPeer();
-    setupChannel(pc.createDataChannel('files'));
-    await pc.setLocalDescription(await pc.createOffer());
-    signal({ sdp: pc.localDescription });
-  }
+  if (msg.type === 'peer-joined') { createPeer(msg.id, msg.name); render(); }
   if (msg.type === 'peer-left') {
-    setStatus('The other person left. Waiting for someone to join…');
-    $('sendBtn').disabled = true;
-    createPeer();
+    peers.get(msg.id)?.pc.close();
+    peers.delete(msg.id);
+    for (const [tid, r] of requests) if (r.peerId === msg.id) requests.delete(tid);
+    render();
   }
   if (msg.type === 'signal') {
+    const peer = peers.get(msg.from);
+    if (!peer) return;
     const { sdp, candidate } = msg.data;
     if (sdp) {
-      await pc.setRemoteDescription(sdp);
+      await peer.pc.setRemoteDescription(sdp);
       if (sdp.type === 'offer') {
-        await pc.setLocalDescription(await pc.createAnswer());
-        signal({ sdp: pc.localDescription });
+        await peer.pc.setLocalDescription(await peer.pc.createAnswer());
+        signal(msg.from, { sdp: peer.pc.localDescription });
       }
     } else if (candidate) {
-      await pc.addIceCandidate(candidate).catch(() => {});
+      await peer.pc.addIceCandidate(candidate).catch(() => {});
     }
   }
 }
 
-function signal(data) { ws.send(JSON.stringify({ type: 'signal', data })); }
-
-function createPeer() {
-  if (pc) pc.close();
-  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-  pc.onicecandidate = (e) => e.candidate && signal({ candidate: e.candidate });
-  pc.ondatachannel = (e) => setupChannel(e.channel);
+function createPeer(id, name) {
+  const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  const peer = { name, pc, control: null, catalog: [], failed: false };
+  peers.set(id, peer);
+  pc.onicecandidate = (e) => e.candidate && signal(id, { candidate: e.candidate });
+  pc.ondatachannel = ({ channel }) => {
+    if (channel.label === 'control') setupControl(id, channel);
+    else receiveTransfer(id, channel);
+  };
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed') setStatus('Direct connection failed (a strict network may be blocking it).');
+    if (pc.connectionState === 'failed') { peer.failed = true; render(); }
+  };
+  return peer;
+}
+
+// ---------- Control channel: shared-file lists, download requests, send offers ----------
+
+function catalog() {
+  return [...myShared].map(([id, f]) => ({ id, name: f.name, size: f.size }));
+}
+
+function sendControl(peerId, msg) {
+  const ch = peers.get(peerId)?.control;
+  if (ch?.readyState === 'open') ch.send(JSON.stringify(msg));
+}
+
+function broadcastCatalog() {
+  for (const id of peers.keys()) sendControl(id, { type: 'catalog', files: catalog() });
+}
+
+function setupControl(peerId, ch) {
+  const peer = peers.get(peerId);
+  peer.control = ch;
+  ch.onopen = () => { sendControl(peerId, { type: 'catalog', files: catalog() }); render(); };
+  ch.onclose = () => render();
+  ch.onmessage = ({ data }) => {
+    const msg = JSON.parse(data);
+    if (msg.type === 'catalog') { peer.catalog = msg.files; render(); }
+    // Someone wants a file we're sharing: send it automatically.
+    if (msg.type === 'request') {
+      const file = myShared.get(msg.fileId);
+      if (file) sendFile(peerId, file, msg.transferId);
+    }
+    // Someone wants to send us a file directly: ask the user first.
+    if (msg.type === 'offer-file') {
+      requests.set(msg.transferId, { peerId, name: msg.name, size: msg.size });
+      render();
+    }
+    if (msg.type === 'answer') {
+      const pending = pendingSends.get(msg.transferId);
+      if (!pending || pending.peerId !== peerId) return;
+      pendingSends.delete(msg.transferId);
+      if (msg.accept) sendFile(peerId, pending.file, msg.transferId, pending.row);
+      else { pending.row.text.textContent = `✕ ${peer.name} declined ${pending.file.name}`; pending.row.bar.remove(); }
+    }
   };
 }
 
-function setupChannel(ch) {
-  channel = ch;
-  channel.binaryType = 'arraybuffer';
-  channel.bufferedAmountLowThreshold = CHUNK * 8;
-  channel.onopen = () => { setStatus('Connected! Pick files to send.'); $('sendBtn').disabled = false; };
-  channel.onclose = () => { $('sendBtn').disabled = true; };
-  channel.onmessage = ({ data }) => {
+$('shareBtn').onclick = () => $('shareInput').click();
+$('shareInput').onchange = () => {
+  for (const file of $('shareInput').files) myShared.set(uid(), file);
+  $('shareInput').value = '';
+  broadcastCatalog();
+  render();
+};
+
+function requestDownload(peerId, f) {
+  const transferId = uid();
+  expected.set(transferId, peerId);
+  sendControl(peerId, { type: 'request', fileId: f.id, transferId });
+}
+
+let sendTarget = null;
+function pickFileFor(peerId) { sendTarget = peerId; $('sendInput').click(); }
+$('sendInput').onchange = () => {
+  const file = $('sendInput').files[0];
+  $('sendInput').value = '';
+  if (!file || !peers.has(sendTarget)) return;
+  const transferId = uid();
+  const row = addTransferRow(`⏳ Waiting for ${nameOf(sendTarget)} to accept ${file.name}…`);
+  pendingSends.set(transferId, { peerId: sendTarget, file, row });
+  sendControl(sendTarget, { type: 'offer-file', transferId, name: file.name, size: file.size });
+};
+
+function answerOffer(transferId, accept) {
+  const r = requests.get(transferId);
+  if (!r) return;
+  requests.delete(transferId);
+  if (accept) expected.set(transferId, r.peerId);
+  sendControl(r.peerId, { type: 'answer', transferId, accept });
+  render();
+}
+
+// ---------- File transfer: one data channel per file, labelled with its transfer id ----------
+
+async function sendFile(peerId, file, transferId, row) {
+  const peer = peers.get(peerId);
+  if (!peer) return;
+  row ??= addTransferRow('');
+  row.text.textContent = `⬆ Sending ${file.name} to ${peer.name}`;
+  const ch = peer.pc.createDataChannel(transferId);
+  ch.bufferedAmountLowThreshold = CHUNK * 8;
+  try {
+    await new Promise((resolve, reject) => { ch.onopen = resolve; ch.onclose = reject; });
+    ch.send(JSON.stringify({ name: file.name, size: file.size, mime: file.type }));
+    for (let offset = 0; offset < file.size; offset += CHUNK) {
+      if (ch.bufferedAmount > ch.bufferedAmountLowThreshold) {
+        await new Promise((resolve) => { ch.onbufferedamountlow = resolve; });
+      }
+      ch.send(await file.slice(offset, offset + CHUNK).arrayBuffer());
+      row.bar.value = Math.min(offset + CHUNK, file.size) / file.size;
+    }
+    row.text.textContent = `✓ Sent ${file.name} to ${peer.name}`;
+  } catch {
+    row.text.textContent = `✕ Sending ${file.name} to ${peer.name} failed`;
+  }
+}
+
+function receiveTransfer(peerId, ch) {
+  // Only accept files we asked for or agreed to.
+  if (expected.get(ch.label) !== peerId) { ch.close(); return; }
+  expected.delete(ch.label);
+  ch.binaryType = 'arraybuffer';
+  let meta, row, received = 0;
+  const chunks = [];
+  const finish = () => {
+    const blob = new Blob(chunks, { type: meta.mime });
+    const a = el('a', { href: URL.createObjectURL(blob), download: meta.name, textContent: `✓ ${meta.name} from ${nameOf(peerId)} (click to save again)` });
+    row.li.replaceChildren(a);
+    a.click();
+    ch.close();
+  };
+  ch.onmessage = ({ data }) => {
     if (typeof data === 'string') {
-      const meta = JSON.parse(data);
-      incoming = { ...meta, chunks: [], received: 0, row: addRow(`⬇ ${meta.name}`) };
-      if (meta.size === 0) finishIncoming();
+      meta = JSON.parse(data);
+      row = addTransferRow(`⬇ Receiving ${meta.name} from ${nameOf(peerId)}`);
+      if (meta.size === 0) finish();
       return;
     }
-    incoming.chunks.push(data);
-    incoming.received += data.byteLength;
-    incoming.row.querySelector('progress').value = incoming.received / incoming.size;
-    if (incoming.received >= incoming.size) finishIncoming();
+    chunks.push(data);
+    received += data.byteLength;
+    row.bar.value = received / meta.size;
+    if (received >= meta.size) finish();
   };
 }
-
-function finishIncoming() {
-  const blob = new Blob(incoming.chunks, { type: incoming.mime });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = incoming.name;
-  a.textContent = `⬇ ${incoming.name} — click to save`;
-  incoming.row.replaceChildren(a);
-  incoming = null;
-}
-
-function waitForBuffer() {
-  if (channel.bufferedAmount <= channel.bufferedAmountLowThreshold) return Promise.resolve();
-  return new Promise((resolve) => { channel.onbufferedamountlow = () => { channel.onbufferedamountlow = null; resolve(); }; });
-}
-
-$('sendBtn').onclick = async () => {
-  const files = [...$('fileInput').files];
-  if (!files.length) return;
-  $('sendBtn').disabled = true;
-  for (const file of files) {
-    const row = addRow(`⬆ ${file.name}`);
-    const bar = row.querySelector('progress');
-    channel.send(JSON.stringify({ name: file.name, size: file.size, mime: file.type }));
-    for (let offset = 0; offset < file.size; offset += CHUNK) {
-      await waitForBuffer();
-      channel.send(await file.slice(offset, offset + CHUNK).arrayBuffer());
-      bar.value = Math.min(offset + CHUNK, file.size) / file.size;
-    }
-    bar.value = 1;
-  }
-  $('fileInput').value = '';
-  $('sendBtn').disabled = channel.readyState !== 'open';
-};
 </script>
 </body>
 </html>

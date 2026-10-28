@@ -6,11 +6,15 @@ encrypted data channel and are never uploaded to the server.
 
 ## How it works
 
-1. Person A opens the site and enters a room name and a password. Because
-   they are first in, that password becomes the room's password.
-2. Person B enters the same room name and password. A wrong password is
-   rejected. A room holds at most 2 people.
-3. Once they are connected, either person can pick files and press **Send**.
+1. Enter your name, a room name and a password. The first person into a
+   room sets its password, and anyone who enters a different password is
+   turned away. A room holds up to 10 people.
+2. **People** lists everyone in the room.
+3. **Share files…** lists a file for the whole room. Anyone can press
+   **Download** and get it straight from your browser, with no action from
+   you, for as long as your tab stays open.
+4. **Send file…** next to a person sends a file to just them. They get an
+   **Accept / Decline** prompt, and it only transfers if they accept.
 
 A room disappears when everyone has left.
 
