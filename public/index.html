@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2P Share</title>
+<style>
+  :root { --bg: #f5f5f4; --card: #fff; --text: #1c1917; --muted: #78716c; --accent: #2563eb; --border: #e7e5e4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1c1917; --card: #292524; --text: #f5f5f4; --muted: #a8a29e; --accent: #60a5fa; --border: #44403c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  main { max-width: 520px; margin: 40px auto; padding: 0 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
+  h1 { margin: 0 0 4px; font-size: 1.5rem; }
+  p.sub { margin: 0 0 20px; color: var(--muted); font-size: .9rem; }
+  label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 4px; }
+  input[type=text], input[type=password] { width: 100%; padding: 10px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+  button { padding: 10px 16px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #status { margin: 16px 0; font-size: .9rem; color: var(--muted); }
+  .hidden { display: none; }
+  ul { list-style: none; padding: 0; margin: 16px 0 0; }
+  li { padding: 10px 0; border-top: 1px solid var(--border); font-size: .9rem; word-break: break-all; }
+  progress { width: 100%; height: 8px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1>P2P Share</h1>
+    <p class="sub">Files go straight from browser to browser. The first person into a room sets its password.</p>
+
+    <form id="joinForm">
+      <label for="room">Room name</label>
+      <input id="room" type="text" required maxlength="64" autocomplete="off">
+      <label for="password">Password</label>
+      <input id="password" type="password" required>
+      <button type="submit">Join room</button>
+    </form>
+
+    <div id="share" class="hidden">
+      <input id="fileInput" type="file" multiple>
+      <button id="sendBtn" disabled>Send</button>
+    </div>
+
+    <div id="status"></div>
+    <ul id="files"></ul>
+  </div>
+</main>
+
+<script>
+const CHUNK = 16 * 1024;
+const $ = (id) => document.getElementById(id);
+let ws, pc, channel, incoming, joined = false;
+
+function setStatus(text) { $('status').textContent = text; }
+
+function addRow(label) {
+  const li = document.createElement('li');
+  li.innerHTML = '<div></div><progress max="1" value="0"></progress>';
+  li.firstChild.textContent = label;
+  $('files').prepend(li);
+  return li;
+}
+
+$('joinForm').onsubmit = (e) => {
+  e.preventDefault();
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}`);
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room: $('room').value, password: $('password').value }));
+  ws.onclose = () => joined && setStatus('Disconnected from server.');
+  // Handle messages one at a time so ICE candidates never race the SDP.
+  let queue = Promise.resolve();
+  ws.onmessage = ({ data }) => { queue = queue.then(() => handle(JSON.parse(data))).catch(console.error); };
+};
+
+async function handle(msg) {
+  if (msg.type === 'error') { setStatus(msg.message); ws.close(); return; }
+  if (msg.type === 'joined') {
+    joined = true;
+    $('joinForm').classList.add('hidden');
+    $('share').classList.remove('hidden');
+    setStatus(msg.peers === 1 ? 'Waiting for the other person to join…' : 'Connecting…');
+    createPeer();
+  }
+  if (msg.type === 'peer-joined') {
+    setStatus('Connecting…');
+    createPeer();
+    setupChannel(pc.createDataChannel('files'));
+    await pc.setLocalDescription(await pc.createOffer());
+    signal({ sdp: pc.localDescription });
+  }
+  if (msg.type === 'peer-left') {
+    setStatus('The other person left. Waiting for someone to join…');
+    $('sendBtn').disabled = true;
+    createPeer();
+  }
+  if (msg.type === 'signal') {
+    const { sdp, candidate } = msg.data;
+    if (sdp) {
+      await pc.setRemoteDescription(sdp);
+      if (sdp.type === 'offer') {
+        await pc.setLocalDescription(await pc.createAnswer());
+        signal({ sdp: pc.localDescription });
+      }
+    } else if (candidate) {
+      await pc.addIceCandidate(candidate).catch(() => {});
+    }
+  }
+}
+
+function signal(data) { ws.send(JSON.stringify({ type: 'signal', data })); }
+
+function createPeer() {
+  if (pc) pc.close();
+  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  pc.onicecandidate = (e) => e.candidate && signal({ candidate: e.candidate });
+  pc.ondatachannel = (e) => setupChannel(e.channel);
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed') setStatus('Direct connection failed (a strict network may be blocking it).');
+  };
+}
+
+function setupChannel(ch) {
+  channel = ch;
+  channel.binaryType = 'arraybuffer';
+  channel.bufferedAmountLowThreshold = CHUNK * 8;
+  channel.onopen = () => { setStatus('Connected! Pick files to send.'); $('sendBtn').disabled = false; };
+  channel.onclose = () => { $('sendBtn').disabled = true; };
+  channel.onmessage = ({ data }) => {
+    if (typeof data === 'string') {
+      const meta = JSON.parse(data);
+      incoming = { ...meta, chunks: [], received: 0, row: addRow(`⬇ ${meta.name}`) };
+      if (meta.size === 0) finishIncoming();
+      return;
+    }
+    incoming.chunks.push(data);
+    incoming.received += data.byteLength;
+    incoming.row.querySelector('progress').value = incoming.received / incoming.size;
+    if (incoming.received >= incoming.size) finishIncoming();
+  };
+}
+
+function finishIncoming() {
+  const blob = new Blob(incoming.chunks, { type: incoming.mime });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = incoming.name;
+  a.textContent = `⬇ ${incoming.name} — click to save`;
+  incoming.row.replaceChildren(a);
+  incoming = null;
+}
+
+function waitForBuffer() {
+  if (channel.bufferedAmount <= channel.bufferedAmountLowThreshold) return Promise.resolve();
+  return new Promise((resolve) => { channel.onbufferedamountlow = () => { channel.onbufferedamountlow = null; resolve(); }; });
+}
+
+$('sendBtn').onclick = async () => {
+  const files = [...$('fileInput').files];
+  if (!files.length) return;
+  $('sendBtn').disabled = true;
+  for (const file of files) {
+    const row = addRow(`⬆ ${file.name}`);
+    const bar = row.querySelector('progress');
+    channel.send(JSON.stringify({ name: file.name, size: file.size, mime: file.type }));
+    for (let offset = 0; offset < file.size; offset += CHUNK) {
+      await waitForBuffer();
+      channel.send(await file.slice(offset, offset + CHUNK).arrayBuffer());
+      bar.value = Math.min(offset + CHUNK, file.size) / file.size;
+    }
+    bar.value = 1;
+  }
+  $('fileInput').value = '';
+  $('sendBtn').disabled = channel.readyState !== 'open';
+};
+</script>
+</body>
+</html>
