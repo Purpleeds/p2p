@@ -86,11 +86,14 @@
 
 <script>
 const CHUNK = 16 * 1024;
+const DIRECT_TIMEOUT = 8000;     // give up on a direct connection after this long
+const RELAY_WINDOW = 1024 * 1024; // max unacknowledged relayed bytes per transfer
+const ID_LEN = 36;               // peer ids and transfer ids are UUIDs
 const $ = (id) => document.getElementById(id);
 const uid = () => crypto.randomUUID();
 
 let ws, myId, myName;
-const peers = new Map();        // peerId -> { name, pc, control, catalog, failed }
+const peers = new Map();        // peerId -> { name, pc, control, catalog, relay, relayChannels }
 const myShared = new Map();     // fileId -> File
 const pendingSends = new Map(); // transferId -> { peerId, file, row } (waiting for accept)
 const expected = new Map();     // transferId -> peerId (files we asked for or accepted)
@@ -126,7 +129,7 @@ function render() {
       btn.onclick = () => pickFileFor(id);
       return el('li', {},
         el('span', { className: 'grow', textContent: p.name }),
-        ready ? null : el('span', { className: 'muted', textContent: p.failed ? "couldn't connect" : 'connecting…' }),
+        el('span', { className: 'muted', textContent: !ready ? 'connecting…' : p.relay ? 'via server' : '' }),
         btn);
     }),
   );
@@ -174,11 +177,14 @@ $('joinForm').onsubmit = (e) => {
   myName = $('name').value.trim();
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}`);
+  ws.binaryType = 'arraybuffer';
   ws.onopen = () => ws.send(JSON.stringify({ type: 'join', name: myName, room: $('room').value, password: $('password').value }));
   ws.onclose = () => { if (myId) $('status').textContent = 'Disconnected from server. Reload to rejoin.'; };
   // Handle messages one at a time so ICE candidates never race the SDP.
   let queue = Promise.resolve();
-  ws.onmessage = ({ data }) => { queue = queue.then(() => handle(JSON.parse(data))).catch(console.error); };
+  ws.onmessage = ({ data }) => {
+    queue = queue.then(() => (typeof data === 'string' ? handle(JSON.parse(data)) : handleRelayData(data))).catch(console.error);
+  };
 };
 
 function signal(to, data) { ws.send(JSON.stringify({ type: 'signal', to, data })); }
@@ -209,6 +215,9 @@ async function handle(msg) {
   if (msg.type === 'signal') {
     const peer = peers.get(msg.from);
     if (!peer) return;
+    if (msg.data.useRelay) return switchToRelay(msg.from, false);
+    if (msg.data.relay) return handleRelayMessage(msg.from, msg.data.relay);
+    if (peer.relay) return;
     const { sdp, candidate } = msg.data;
     if (sdp) {
       await peer.pc.setRemoteDescription(sdp);
@@ -224,15 +233,19 @@ async function handle(msg) {
 
 function createPeer(id, name) {
   const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-  const peer = { name, pc, control: null, catalog: [], failed: false };
+  const peer = { name, pc, control: null, catalog: [], relay: false, relayChannels: new Map() };
   peers.set(id, peer);
+  // If the browsers can't reach each other directly, send everything through the server.
+  setTimeout(() => {
+    if (peers.get(id) === peer && peer.control?.readyState !== 'open') switchToRelay(id, true);
+  }, DIRECT_TIMEOUT);
   pc.onicecandidate = (e) => e.candidate && signal(id, { candidate: e.candidate });
   pc.ondatachannel = ({ channel }) => {
     if (channel.label === 'control') setupControl(id, channel);
     else receiveTransfer(id, channel);
   };
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed') { peer.failed = true; render(); }
+    if (pc.connectionState === 'failed') switchToRelay(id, true);
   };
   return peer;
 }
@@ -257,6 +270,8 @@ function setupControl(peerId, ch) {
   peer.control = ch;
   ch.onopen = () => { sendControl(peerId, { type: 'catalog', files: catalog() }); render(); };
   ch.onclose = () => render();
+  // Some browsers hand over a channel that is already open.
+  if (ch.readyState === 'open') ch.onopen();
   ch.onmessage = ({ data }) => {
     const msg = JSON.parse(data);
     if (msg.type === 'catalog') { peer.catalog = msg.files; render(); }
@@ -322,10 +337,10 @@ async function sendFile(peerId, file, transferId, row) {
   if (!peer) return;
   row ??= addTransferRow('');
   row.text.textContent = `⬆ Sending ${file.name} to ${peer.name}`;
-  const ch = peer.pc.createDataChannel(transferId);
+  const ch = openChannel(peerId, transferId);
   ch.bufferedAmountLowThreshold = CHUNK * 8;
   try {
-    await new Promise((resolve, reject) => { ch.onopen = resolve; ch.onclose = reject; });
+    if (ch.readyState !== 'open') await new Promise((resolve, reject) => { ch.onopen = resolve; ch.onclose = reject; });
     ch.send(JSON.stringify({ name: file.name, size: file.size, mime: file.type }));
     for (let offset = 0; offset < file.size; offset += CHUNK) {
       if (ch.bufferedAmount > ch.bufferedAmountLowThreshold) {
@@ -366,6 +381,101 @@ function receiveTransfer(peerId, ch) {
     row.bar.value = received / meta.size;
     if (received >= meta.size) finish();
   };
+}
+// ---------- Server relay: fallback when a direct connection can't be made ----------
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+// Stand-in for RTCDataChannel that tunnels through the server. Text goes as
+// signaling messages; file chunks go as binary frames [target id][label][data].
+// The receiver acks every chunk, so at most RELAY_WINDOW bytes per transfer sit
+// in the server at once.
+class RelayChannel {
+  readyState = 'open';
+  bufferedAmount = 0;
+  onopen = null;
+  onmessage = null;
+  onclose = null;
+  onbufferedamountlow = null;
+
+  constructor(peerId, label) {
+    this.peerId = peerId;
+    this.label = label;
+    peers.get(peerId).relayChannels.set(label, this);
+  }
+
+  get bufferedAmountLowThreshold() { return RELAY_WINDOW; }
+  set bufferedAmountLowThreshold(_) {}
+
+  send(data) {
+    if (this.readyState !== 'open') throw new Error('Channel closed');
+    if (typeof data === 'string') return relaySend(this.peerId, this.label, 'msg', { data });
+    this.bufferedAmount += data.byteLength;
+    const frame = new Uint8Array(ID_LEN * 2 + data.byteLength);
+    frame.set(enc.encode(this.peerId), 0);
+    frame.set(enc.encode(this.label.padEnd(ID_LEN)), ID_LEN);
+    frame.set(new Uint8Array(data), ID_LEN * 2);
+    ws.send(frame);
+  }
+
+  ack(bytes) {
+    const wasFull = this.bufferedAmount > RELAY_WINDOW;
+    this.bufferedAmount -= bytes;
+    if (wasFull && this.bufferedAmount <= RELAY_WINDOW) this.onbufferedamountlow?.();
+  }
+
+  close() {
+    if (this.readyState === 'closed') return;
+    relaySend(this.peerId, this.label, 'close');
+    this.closed();
+  }
+
+  closed() {
+    this.readyState = 'closed';
+    peers.get(this.peerId)?.relayChannels.delete(this.label);
+    this.onclose?.();
+  }
+}
+
+function relaySend(peerId, label, kind, extra) {
+  signal(peerId, { relay: { label, kind, ...extra } });
+}
+
+function switchToRelay(peerId, notify) {
+  const peer = peers.get(peerId);
+  if (!peer || peer.relay) return;
+  peer.relay = true;
+  if (notify) signal(peerId, { useRelay: true });
+  peer.pc.close();
+  setupControl(peerId, new RelayChannel(peerId, 'control'));
+}
+
+function openChannel(peerId, label) {
+  const peer = peers.get(peerId);
+  if (!peer.relay) return peer.pc.createDataChannel(label);
+  relaySend(peerId, label, 'open');
+  return new RelayChannel(peerId, label);
+}
+
+function handleRelayMessage(peerId, { label, kind, data, bytes }) {
+  switchToRelay(peerId, false);
+  const peer = peers.get(peerId);
+  const ch = peer.relayChannels.get(label);
+  if (kind === 'open' && !ch) receiveTransfer(peerId, new RelayChannel(peerId, label));
+  if (kind === 'msg') ch?.onmessage?.({ data });
+  if (kind === 'ack') ch?.ack(bytes);
+  if (kind === 'close') ch?.closed();
+}
+
+function handleRelayData(buf) {
+  const peerId = dec.decode(new Uint8Array(buf, 0, ID_LEN));
+  const label = dec.decode(new Uint8Array(buf, ID_LEN, ID_LEN)).trim();
+  const ch = peers.get(peerId)?.relayChannels.get(label);
+  if (!ch) return;
+  const data = buf.slice(ID_LEN * 2);
+  ch.onmessage?.({ data });
+  relaySend(peerId, label, 'ack', { bytes: data.byteLength });
 }
 </script>
 </body>

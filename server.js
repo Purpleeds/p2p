@@ -1,6 +1,7 @@
 // Signaling server: serves the web page, tracks who is in each
 // password-protected room, and relays WebRTC handshake messages between
-// peers. Files never pass through here — they travel directly between browsers.
+// peers. Files normally travel directly between browsers; when two browsers
+// can't reach each other, they fall back to relaying file data through here.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -9,6 +10,7 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
 const MAX_PEERS = 10;
+const ID_LEN = 36; // length of a UUID
 const INDEX = fs.readFileSync(path.join(__dirname, 'public', 'index.html'));
 
 // room name -> { salt, hash, peers: Map<id, ws> }
@@ -51,7 +53,15 @@ wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  ws.on('message', (raw) => {
+  ws.on('message', (raw, isBinary) => {
+    // Relayed file data: [36-byte target id][rest]. Swap in the sender's id and forward.
+    if (isBinary) {
+      const target = rooms.get(ws.room)?.peers.get(raw.toString('ascii', 0, ID_LEN));
+      if (!target || raw.length < ID_LEN) return;
+      raw.write(ws.id, 0, 'ascii');
+      return target.send(raw);
+    }
+
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 

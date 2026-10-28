@@ -1,8 +1,9 @@
 # P2P Share
 
-Password-locked, browser-to-browser file sharing. The server only does the
-WebRTC handshake. Files go directly between the two browsers over an
-encrypted data channel and are never uploaded to the server.
+Password-locked, browser-to-browser file sharing. The server connects
+people. Files go directly between browsers over an encrypted WebRTC data
+channel, and only go through the server as a fallback when a direct
+connection isn't possible. Files are never stored on the server.
 
 ## How it works
 
@@ -36,9 +37,12 @@ npm start   # http://localhost:3000
 
 ## Notes
 
-- Only a public STUN server is used, so a few strict networks (some
-  corporate or mobile networks) can't connect directly. To support those,
-  add a TURN server to `iceServers` in `public/index.html`.
+- Files go directly between browsers when possible. If two browsers can't
+  reach each other within about 8 seconds (common on mobile data and some
+  Wi-Fi networks), they automatically send through the server instead, and
+  the people list shows "via server". Relayed files pass through the
+  server's memory in small pieces and are never saved, but they do count
+  toward your Render bandwidth.
 - Received files are held in memory before you save them, so very large
   files (several GB) may not work well.
 - Render's free plan sleeps when idle, so the first visit can take around
